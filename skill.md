@@ -29,6 +29,8 @@ Use this when `/rival` is too narrow (single file or diff) and `/raadsmid` is to
 /crucible --include-tests              # Don't skip *.test.* files
 /crucible --no-meta                    # Skip cross-file architectural meta-pass
 /crucible --deployment-context "..."   # Free-text scoping (e.g. "desktop Tauri sidecar")
+/crucible --verify                     # Dynamic verification: write + run repro harnesses for runtime-tagged findings
+/crucible --symptoms "audio not captured"  # Feed observed failures to the panel
 ```
 
 Combine freely: `/crucible --all --deep --blind` runs full repo with 3 models per file independently.
@@ -238,6 +240,29 @@ Prompt template (see `review-prompts.md` → "Cross-file meta-pass"). Goal: find
 
 Save meta-findings to `findings/_meta.json` with `"file": null` and `"category": "architecture"`.
 
+### Phase 5.5 — Dynamic Verification (opt-in `--verify`)
+
+After the meta-pass and before the report, when `--verify` is set, run the dynamic-verification stage. For each finding the panel tagged `runtime_checkable` (stateful / concurrency / timing / ordering / resource-leak / off-by-one / silent-failure), a panel model writes a minimal repro harness and the stage RUNS it in a locked sandbox:
+
+- temp-dir COPY of the target file (never the live working tree)
+- NO network (Python socket block via a runpy preamble; node `--require` shim; bash proxy-blackhole)
+- hard wall-clock timeout (default 15s); on macOS the CPU and file-size rlimits also apply, memory rlimit is best-effort (Darwin rejects RLIMIT_AS)
+- scrubbed environment
+
+```bash
+python3 "$(dirname "$(realpath ~/.claude/skills/crucible/skill.md)")/scripts/verify_findings.py" \
+  --cache-dir .crucible-cache/<run-id> \
+  --models <model-id-1> <model-id-2> \
+  --prompt-templates ~/.claude/skills/crucible/review-prompts.md \
+  --symptoms "..."   # optional
+```
+
+Harnesses must print `CRUCIBLE_VERDICT: REPRODUCED` / `NOT_REPRODUCED` and exit 0; an inconclusive run is repaired up to `--max-repair` times. Results land in `verification.json` (+ harness/output under `verification/`). The report builder promotes reproduced findings to a **VERIFIED (executed repro)** tier and demotes failed repros to **Unconfirmed Hypotheses**.
+
+Cost: $0 on default runs (stage never fires). With `--verify`, ~1–3 model calls per runtime-tagged finding — a few cents for a handful. Bounded by `--verify-limit` (default 10; dropped findings are logged, never silently truncated).
+
+**Safety note:** this stage executes MODEL-WRITTEN code against the target. The sandbox bounds network/CPU/file-size/wall-clock and runs against a copy, but filesystem reads are NOT isolated and the network block is in-process only — do not point `--verify` at a target whose mere import performs destructive disk operations.
+
 ### Phase 6 — Aggregate and Write Report (run the report builder)
 
 Run the bundled report builder once the orchestrator is done:
@@ -323,6 +348,7 @@ After `build_report.py` lands `report.md`, do this verification pass:
    - Verify the title accurately describes what's there
    - Confirm the bug is genuinely present (not a misreading of safe code)
    - Check the suggested fix would actually work in context
+   - For any finding in the **VERIFIED (executed repro)** tier, read the attached harness + output: confirm the harness actually drives the cited bug (not a trivially-passing or mis-targeted script). Executed-repro is strong evidence, not gospel.
 
 3. **Categorize each verified finding** into one of:
    - ✓ **Confirmed** — bug is real, fix is sound
@@ -413,6 +439,7 @@ For R: re-run from Phase 1 with the same scope and options.
 - **`scripts/build_report.py`** — aggregates per-file findings into `report.md`, with consensus dedup for `--blind` mode.
 - **`scripts/compare-reports.py`** — diffs two run cache directories side-by-side; surfaces findings unique to each, shared findings, and per-side model/cost stats. Usage: `python compare-reports.py --left <cache-A> --right <cache-B>`.
 - **`scripts/crucible-run.sh`** — single-command end-to-end wrapper: discover → orchestrate → build_report. Usage: `./scripts/crucible-run.sh [--mode sequential|blind] [--no-meta] [--panel-size N] <files...>`. Reduces the LLM workflow to one invocation when running scripted/CI.
+- **`scripts/verify_findings.py`** — dynamic-verification stage (opt-in `--verify`). Selects runtime-checkable findings, has a panel model write a repro harness for each, runs it sandboxed (no-net / timeout / mem-cap / temp-dir copy), and writes `verification.json`. Token-free safety check: `python3 scripts/verify_findings.py --self-test`.
 - **`scripts/chunk-file.py`** — splits source files >1500 lines into language-aware logical chunks (functions/classes for Python/JS/TS/Go/Rust, function defs for Bash). Used by the LLM workflow for files that exceed the per-prompt limit. Outputs temp chunk paths plus line-range metadata so findings can be mapped back to original line numbers.
 
 ---
