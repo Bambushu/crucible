@@ -38,7 +38,9 @@ OUTPUT FORMAT — return ONLY a single JSON object, no prose, no markdown fences
       "category": "security|bug|performance|correctness|maintainability",
       "title": "Short one-line summary",
       "explanation": "What is wrong and why it matters in 1-3 sentences",
-      "suggestion": "Concrete fix in 1-2 sentences, with code snippet if helpful"
+      "suggestion": "Concrete fix in 1-2 sentences, with code snippet if helpful",
+      "runtime_checkable": true,
+      "repro_hypothesis": "One line: what to drive and what the run should show"
     }
   ]
 }
@@ -48,6 +50,8 @@ Severity guide:
 - high: significant bug that affects core behavior or security
 - medium: edge case, reliability concern, or maintainability hazard with real cost
 - low: minor improvement, easy win
+
+RUNTIME-CHECKABLE TAGGING: For each finding, set "runtime_checkable": true ONLY when it could be PROVEN BY RUNNING CODE rather than by reading it — stateful interactions, concurrency, timing/ordering, resource leaks, off-by-one over a sequence, or silent failures. For those, add a one-line "repro_hypothesis": what to drive and what the run should show. Otherwise set "runtime_checkable": false and omit repro_hypothesis.
 
 LANGUAGE: <inferred-language>
 FILE: <file-path> (<line-count> lines)
@@ -73,6 +77,8 @@ Your job:
 
 Same severity guide and category list as before. Same rules — skip style, no speculation, no test-coverage notes.
 
+RUNTIME-CHECKABLE TAGGING: For each finding, set "runtime_checkable": true ONLY when it could be PROVEN BY RUNNING CODE rather than by reading it — stateful interactions, concurrency, timing/ordering, resource leaks, off-by-one over a sequence, or silent failures. For those, add a one-line "repro_hypothesis": what to drive and what the run should show. Otherwise set "runtime_checkable": false and omit repro_hypothesis.
+
 OUTPUT FORMAT — return ONLY a single JSON object:
 
 {
@@ -87,7 +93,9 @@ OUTPUT FORMAT — return ONLY a single JSON object:
       "category": "security|bug|performance|correctness|maintainability",
       "title": "...",
       "explanation": "...",
-      "suggestion": "..."
+      "suggestion": "...",
+      "runtime_checkable": true,
+      "repro_hypothesis": "One line: what to drive and what the run should show"
     }
   ]
 }
@@ -118,6 +126,8 @@ Rules:
 4. Calibrate severity ruthlessly — every finding you keep is a real issue worth a developer's time
 5. Eliminate duplicates — if Reviewer 1 and Reviewer 2 both flagged the same thing, it appears once in your output
 
+RUNTIME-CHECKABLE TAGGING: For each finding, set "runtime_checkable": true ONLY when it could be PROVEN BY RUNNING CODE rather than by reading it — stateful interactions, concurrency, timing/ordering, resource leaks, off-by-one over a sequence, or silent failures. For those, add a one-line "repro_hypothesis": what to drive and what the run should show. Otherwise set "runtime_checkable": false and omit repro_hypothesis.
+
 OUTPUT FORMAT — return ONLY a single JSON object containing the FINAL consolidated findings for this file:
 
 {
@@ -130,7 +140,9 @@ OUTPUT FORMAT — return ONLY a single JSON object containing the FINAL consolid
       "title": "...",
       "explanation": "...",
       "suggestion": "...",
-      "flagged_by": ["reviewer-1", "reviewer-2", "reviewer-3"]
+      "flagged_by": ["reviewer-1", "reviewer-2", "reviewer-3"],
+      "runtime_checkable": true,
+      "repro_hypothesis": "One line: what to drive and what the run should show"
     }
   ]
 }
@@ -196,6 +208,62 @@ PER-FILE FINDINGS SUMMARY (titles + severities only, full text omitted to keep p
 
 FILE LIST REVIEWED:
 <file-list>
+```
+
+---
+
+## Dynamic Verification — Harness Writer
+
+Used by `verify_findings.py` to turn a runtime-checkable finding into an executable repro.
+
+```
+You are writing a MINIMAL, SELF-CONTAINED repro harness that proves (or disproves) ONE specific code-review finding by RUNNING it. You are not reviewing — you are reproducing.
+
+THE FINDING:
+<finding-json>
+
+REPRO HYPOTHESIS (what to drive, what the run should show):
+<repro-hypothesis>
+
+OPERATIONAL SYMPTOMS reported by the user (may be empty):
+<operational-symptoms>
+
+THE TARGET FILE (<inferred-language>), available to your harness as a sibling module — it is copied next to your harness, import it by its basename WITHOUT path:
+FILE: <target-file-path>
+<file-contents-with-line-numbers>
+
+HARD RULES — the harness runs in a locked sandbox:
+1. SELF-CONTAINED. One file. Import ONLY the unit under test from the target module (e.g. `from advisor import Advisor`). Do NOT import or invoke its main()/CLI entry point.
+2. NO NETWORK. Every socket / HTTP / LLM / DB call WILL RAISE. If the unit under test makes such calls, MONKEYPATCH or stub them so the logic runs deterministically offline. CRITICAL: if a method only sets important state on its SUCCESS path (and skips it on a network-error path), letting the call fail will NOT reproduce the bug — you must simulate a SUCCESSFUL call by monkeypatching the method to set that state and return success.
+3. TIMING/ASYNC. If the bug involves threads/timers/scheduling, drive it deterministically and WAIT LONGER than the relevant delay before you assert (e.g. if a replay timer is 0.05s, sleep ~0.3s).
+4. VERDICT CONTRACT. Print the observed evidence (counts/values), then print EXACTLY ONE of:
+       CRUCIBLE_VERDICT: REPRODUCED
+       CRUCIBLE_VERDICT: NOT_REPRODUCED
+   then exit 0 in BOTH cases. REPRODUCED means the finding's bug was observed; NOT_REPRODUCED means you drove it and the bug did not occur.
+5. NO destructive operations (no file deletion, no os.system to mutate state, no writes outside the working dir).
+
+OUTPUT: return ONLY a single JSON object, no prose, no markdown fences:
+{"language": "python|node|bash", "harness": "<the full harness source as a string>", "notes": "one line: how it drives the bug"}
+```
+
+## Dynamic Verification — Harness Repair
+
+Used when a harness failed to run cleanly or produced no verdict.
+
+```
+Your previous repro harness did not run cleanly or printed no CRUCIBLE_VERDICT line. Fix it. Same sandbox rules as before (self-contained, NO network — monkeypatch any network/LLM call, simulate the SUCCESS path if the bug needs it, wait past any timer delay, print exactly one CRUCIBLE_VERDICT and exit 0).
+
+THE FINDING:
+<finding-json>
+
+YOUR PREVIOUS HARNESS:
+<previous-harness>
+
+CAPTURED OUTPUT (stdout + stderr from running it):
+<captured-output>
+
+OUTPUT: return ONLY a single JSON object:
+{"language": "python|node|bash", "harness": "<the full corrected harness source>", "notes": "what you fixed"}
 ```
 
 ---

@@ -92,6 +92,8 @@ def load_prompt_templates(path: Path) -> dict[str, str]:
         "pass2_seq": "Pass 2 — Sequential Chain (second model, sees prior findings)",
         "pass3_consol": "Pass 3 — Consolidator (final model in --deep sequential mode)",
         "meta": "Cross-File Meta-Pass (one model, after all per-file reviews)",
+        "harness_writer": "Dynamic Verification — Harness Writer",
+        "harness_repair": "Dynamic Verification — Harness Repair",
     }
     out: dict[str, str] = {}
     for short, full in keymap.items():
@@ -156,6 +158,21 @@ def splice_deployment_context(file_text: str, deployment_context: str) -> str:
         "=== DEPLOYMENT CONTEXT (read before reviewing the code below) ===\n"
         f"{deployment_context}\n"
         "=== END DEPLOYMENT CONTEXT ===\n\n"
+        + file_text
+    )
+
+
+def splice_symptoms(file_text: str, symptoms: str) -> str:
+    """Prepend an operational-symptoms block so models can match the code
+    against observed failures (mirrors splice_deployment_context). Distinct
+    label so the panel treats it as 'what went wrong in the field', not as
+    deployment shape."""
+    if not symptoms:
+        return file_text
+    return (
+        "=== OPERATIONAL SYMPTOMS (observed failures — match the code against these) ===\n"
+        f"{symptoms}\n"
+        "=== END OPERATIONAL SYMPTOMS ===\n\n"
         + file_text
     )
 
@@ -261,7 +278,14 @@ def extract_model_output(raw: dict) -> str:
 # ─────────────────────── JSON extraction from model output ───────────────────────
 
 def extract_json_object(text: str) -> Optional[dict]:
-    """Find and parse the first JSON object in text, tolerating ```json fences and prose."""
+    """Find and parse the first JSON object in text, tolerating ```json fences and prose.
+
+    If a candidate object closes but fails to parse, scan forward to the next
+    `{`. BUT if the first/outer object opens and never closes (truncated output),
+    return None instead of falling through to a nested inner object: returning a
+    partial fragment (e.g. a lone validates[] entry from a cut-off pass-2
+    response) silently corrupts the caller's merge step.
+    """
     if not text:
         return None
     # Strip code fences
@@ -271,17 +295,23 @@ def extract_json_object(text: str) -> Optional[dict]:
     start = text.find("{")
     while start != -1:
         depth = 0
+        closed = False
         for i in range(start, len(text)):
             if text[i] == "{":
                 depth += 1
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
+                    closed = True
                     candidate = text[start:i+1]
                     try:
                         return json.loads(candidate)
                     except json.JSONDecodeError:
                         break
+        if not closed:
+            # Outer object never closed → truncated. Do not skip ahead to an
+            # inner object; that yields a misleading partial fragment.
+            return None
         start = text.find("{", start + 1)
     return None
 
@@ -354,6 +384,52 @@ def update_health(
 
 # ─────────────────────── per-file review ───────────────────────
 
+def merge_pass_findings(
+    prior_findings: list[dict],
+    parsed: dict,
+    idx: int,
+    mode: str,
+    model: str,
+) -> tuple[list[dict], dict]:
+    """Fold one parsed pass result into the running per-file baseline.
+
+    Returns (updated_findings, pass_result_entry). Contract:
+
+      - ``new_findings`` present → sequential pass 2+: append to the baseline.
+      - ``findings`` present AND (first pass OR blind mode) → take as the
+        baseline. In blind mode every model runs the pass-1 template, so each
+        returns ``findings``; the top-level list carries the latest pass while
+        build_report reconstructs the full multi-model set from passes[].
+      - otherwise → a non-baseline pass that returned neither key (e.g. a
+        truncated response that parsed as a partial inner object). The baseline
+        is returned UNCHANGED and the pass is flagged ``malformed_pass2``.
+
+    The final branch is the bug fix: the old code let any pass without
+    ``new_findings`` overwrite the baseline with ``parsed.get("findings", [])``
+    — so a truncated pass 2 silently wiped every finding from pass 1.
+    """
+    if "new_findings" in parsed:
+        new = parsed.get("new_findings", [])
+        return prior_findings + new, {
+            "model": model,
+            "status": "ok",
+            "validates": parsed.get("validates", []),
+            "new_findings": new,
+        }
+    if "findings" in parsed and (idx == 0 or mode == "blind"):
+        findings = parsed.get("findings", [])
+        return findings, {
+            "model": model,
+            "status": "ok",
+            "findings": findings,
+        }
+    return prior_findings, {
+        "model": model,
+        "status": "malformed_pass2",
+        "keys_seen": sorted(parsed.keys()),
+    }
+
+
 def review_one_file(
     file_path: Path,
     cache_dir: Path,
@@ -365,6 +441,7 @@ def review_one_file(
     delay_between_calls: int,
     mode: str,
     deployment_context: str = "",
+    symptoms: str = "",
     costs_log: Optional[list] = None,
 ) -> dict:
     """
@@ -381,6 +458,7 @@ def review_one_file(
     lang = infer_language(rel)
 
     file_text = splice_deployment_context(file_text, deployment_context)
+    file_text = splice_symptoms(file_text, symptoms)
 
     active_models = [m for m in models if healthy.get(m, True)]
     if not active_models:
@@ -459,24 +537,17 @@ def review_one_file(
         # recovered should stay in the panel.
         update_health(consecutive_failures, healthy, model, ok=True)
 
-        # Pass 2 sequential returns {validates, new_findings}; merge into prior_findings
-        if "new_findings" in parsed:
-            new = parsed.get("new_findings", [])
-            prior_findings = prior_findings + new
-            pass_results.append({
-                "model": model,
-                "status": "ok",
-                "validates": parsed.get("validates", []),
-                "new_findings": new,
-            })
-        else:
-            findings = parsed.get("findings", [])
-            prior_findings = findings  # Pass 1 sets the baseline
-            pass_results.append({
-                "model": model,
-                "status": "ok",
-                "findings": findings,
-            })
+        # Fold this pass into the baseline. The helper guarantees a malformed
+        # or truncated pass 2+ can never wipe prior-pass findings.
+        prior_findings, pass_entry = merge_pass_findings(prior_findings, parsed, idx, mode, model)
+        pass_results.append(pass_entry)
+        if pass_entry["status"] == "malformed_pass2":
+            print(
+                f"  ⚠ {model}: pass {idx + 1} parsed but lacked new_findings/findings "
+                f"(keys={pass_entry['keys_seen']}); keeping prior baseline "
+                f"({len(prior_findings)} findings)",
+                file=sys.stderr,
+            )
 
     duration = round(time.time() - started, 1)
     aggregated = {
@@ -628,6 +699,15 @@ def main() -> int:
             "like multi-worker uvicorn settings on a desktop app."
         ),
     )
+    p.add_argument(
+        "--symptoms",
+        default="",
+        help=(
+            "Free-text operational symptoms (observed failures), e.g. "
+            "'audio silently not captured'. Spliced into each per-file prompt "
+            "so the panel can match the code against what actually went wrong."
+        ),
+    )
     args = p.parse_args()
 
     cache_dir = Path(args.cache_dir).resolve()
@@ -671,6 +751,8 @@ def main() -> int:
     print(f"  Mode:   {args.mode}", file=sys.stderr)
     if args.deployment_context:
         print(f"  Deployment context: {args.deployment_context[:140]}{'…' if len(args.deployment_context) > 140 else ''}", file=sys.stderr)
+    if args.symptoms:
+        print(f"  Symptoms: {args.symptoms[:140]}{'…' if len(args.symptoms) > 140 else ''}", file=sys.stderr)
     print("", file=sys.stderr)
 
     # Resume support: skip files that already have a findings JSON
@@ -704,6 +786,7 @@ def main() -> int:
             delay_between_calls=args.delay_between_calls,
             mode=args.mode,
             deployment_context=args.deployment_context,
+            symptoms=args.symptoms,
             costs_log=costs_log,
         )
         write_findings(cache_dir, str(path), result)
@@ -793,7 +876,46 @@ def _self_test() -> int:
     assert hp2["test_model"] is False, "model should be dropped after 3 consecutive fails"
     assert cf2["test_model"] == 3
 
-    print("✓ self-test passed: 2-fail + success + 2-fail does NOT drop; 3 consecutive does drop")
+    # Case 3: extract_json_object must NOT return a partial inner fragment when
+    # the outer object is truncated (unclosed). Reproduces the Gemini pass-2
+    # truncation that returned a lone validates[] entry — which then starved
+    # the merge step and wiped pass-1's findings.
+    truncated = (
+        '{"validates": [{"prior_finding_index": 0, "verdict": "agree", '
+        '"note": "confirmed"}], "new_findings": [{"title": "x"'
+    )  # outer { never closes; the inner validates entry DOES close
+    assert extract_json_object(truncated) is None, (
+        "truncated/unclosed outer object must parse to None, not a partial "
+        f"inner fragment (got {extract_json_object(truncated)!r})"
+    )
+    # Sanity: well-formed JSON still parses; prose-before-JSON still recovers.
+    assert extract_json_object('{"findings": []}') == {"findings": []}
+    assert extract_json_object('noise {bad} then {"findings": [1]}') == {"findings": [1]}
+
+    # Case 4: pass-2 merge must never wipe the pass-1 baseline.
+    baseline = [{"title": "real bug", "severity": "high", "line": 10}]
+    # 4a — truncated/partial pass-2 object (no new_findings, no findings):
+    partial = {"prior_finding_index": 0, "verdict": "agree"}
+    merged, entry = merge_pass_findings(baseline, partial, idx=1, mode="sequential", model="m2")
+    assert merged == baseline, f"baseline wiped by malformed pass-2 (got {merged})"
+    assert entry["status"] == "malformed_pass2", f"expected malformed_pass2, got {entry['status']}"
+    # 4b — valid pass-2 with new_findings merges onto baseline:
+    nf = {"validates": [], "new_findings": [{"title": "extra", "severity": "low", "line": 5}]}
+    merged2, entry2 = merge_pass_findings(baseline, nf, idx=1, mode="sequential", model="m2")
+    assert len(merged2) == 2, f"new_findings not merged (got {merged2})"
+    assert entry2["status"] == "ok"
+    # 4c — pass 1 (idx 0) sets the baseline from its findings:
+    p1 = {"findings": [{"title": "b", "severity": "low", "line": 1}]}
+    merged3, entry3 = merge_pass_findings([], p1, idx=0, mode="sequential", model="m1")
+    assert merged3 == p1["findings"]
+    assert entry3["status"] == "ok"
+    # 4d — blind pass 2 (idx>0) still takes its own findings (mode-specific):
+    pb = {"findings": [{"title": "c", "severity": "low", "line": 2}]}
+    merged4, _ = merge_pass_findings(baseline, pb, idx=1, mode="blind", model="m2")
+    assert merged4 == pb["findings"], "blind pass-2 should set its own findings"
+
+    print("✓ self-test passed: health threshold; JSON truncation → None; "
+          "pass-2 merge preserves baseline")
     return 0
 
 

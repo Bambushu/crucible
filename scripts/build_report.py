@@ -64,6 +64,24 @@ def load_findings(cache_dir: Path) -> tuple[list[dict], list[dict], dict]:
     return per_file, meta, manifest
 
 
+def load_verification(cache_dir: Path) -> dict:
+    """Map (file, line:int, title) -> verification result. Empty if no file."""
+    vpath = cache_dir / "verification.json"
+    if not vpath.exists():
+        return {}
+    try:
+        data = json.loads(vpath.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for r in data.get("results", []):
+        key = r.get("key")
+        if not key or len(key) != 3:
+            continue
+        out[(key[0], _line_int(key[1]), key[2])] = r
+    return out
+
+
 def reconstruct_run_state(cache_dir: Path) -> dict:
     """Pull run metadata from cache artifacts the orchestrator already
     writes — progress.jsonl (per-file events with passes[].model), run.log
@@ -245,13 +263,23 @@ def merge_cluster(cluster: list[dict]) -> dict:
     return base
 
 
-def render_report(per_file: list[dict], meta: list[dict], manifest: dict) -> str:
+def render_report(per_file: list[dict], meta: list[dict], manifest: dict, verification: dict | None = None) -> str:
     """Render the final report.md content."""
     models = manifest.get("models", []) or []
     models_str = ", ".join(models) if models else "unknown"
     mode = manifest.get("mode", "sequential")
     scope = manifest.get("scope", "unspecified")
     run_id = manifest.get("run_id", "unknown")
+
+    vmap = {}
+    if verification:
+        if "results" in verification:
+            for r in verification.get("results", []):
+                key = r.get("key")
+                if key and len(key) == 3:
+                    vmap[(key[0], _line_int(key[1]), key[2])] = r
+        else:
+            vmap = verification
 
     # Build per-file attribution map: which model(s) actually flagged each
     # finding in their pass-level output. The top-level `findings` array on
@@ -269,10 +297,23 @@ def render_report(per_file: list[dict], meta: list[dict], manifest: dict) -> str
         amap = attribution_by_file.get(file, [])
         for f in entry.get("findings", []):
             norm = normalize_finding(f, file, models)
+            norm["_match_title"] = f.get("title", "")  # raw title, matches verify_findings.finding_key
             attribs = lookup_attribution(amap, f)
             if attribs:
                 norm["flagged_by"] = attribs
             flat.append(norm)
+
+    for f in flat:
+        rec = vmap.get((f["file"], _line_int(f["line"]), f.get("_match_title", f["title"])))
+        f["_verdict"] = rec.get("verdict") if rec else None
+        f["_vrec"] = rec
+        if rec and rec.get("verdict") == "inconclusive":
+            note = f" _(repro inconclusive: {rec.get('reason','')})_"
+            f["explanation"] = (f.get("explanation", "") + note).strip()
+
+    verified = [f for f in flat if f.get("_verdict") == "reproduced"]
+    unconfirmed = [f for f in flat if f.get("_verdict") == "not_reproduced"]
+    flat = [f for f in flat if f.get("_verdict") not in ("reproduced", "not_reproduced")]
 
     if mode == "blind":
         flat = consensus_dedup(flat)
@@ -299,6 +340,60 @@ def render_report(per_file: list[dict], meta: list[dict], manifest: dict) -> str
     out.append("")
     out.append("---")
     out.append("")
+
+    # VERIFIED tier — confirmed by an executed repro harness. Rendered first.
+    if verified or unconfirmed:
+        out.append(f"## VERIFIED (executed repro)  ({len(verified)})")
+        out.append("")
+        if not verified:
+            out.append("_No findings reproduced by an executed harness._")
+            out.append("")
+        for f in verified:
+            rec = f.get("_vrec") or {}
+            out.append(f"### `{f['file']}:{f['line']}` — {f['title']}")
+            out.append(f"**Verdict:** reproduced via executed harness "
+                       f"(model: {rec.get('model','?')}, {rec.get('attempts','?')} attempt(s))")
+            out.append(f"**Original severity:** {f['severity']}")
+            if f.get("explanation"):
+                out.append(f"**Why it matters:** {f['explanation']}")
+            if f.get("suggestion"):
+                out.append(f"**Fix:** {f['suggestion']}")
+            lang = rec.get("language") or "text"
+            if rec.get("harness"):
+                out.append("")
+                out.append("<details><summary>Repro harness</summary>")
+                out.append("")
+                out.append(f"```{lang}")
+                out.append(rec["harness"])
+                out.append("```")
+                out.append("</details>")
+            if rec.get("output_excerpt"):
+                out.append("")
+                out.append("**Harness output:**")
+                out.append("```")
+                out.append(rec["output_excerpt"])
+                out.append("```")
+            out.append("")
+        out.append("---")
+        out.append("")
+
+    # Unconfirmed — repro ran but did not reproduce; demoted out of severity tiers.
+    if unconfirmed:
+        out.append(f"## Unconfirmed Hypotheses  ({len(unconfirmed)})")
+        out.append("")
+        out.append("_These findings were tagged runtime-checkable, but the executed repro "
+                   "harness did NOT reproduce them. Treat as unconfirmed._")
+        out.append("")
+        for f in unconfirmed:
+            rec = f.get("_vrec") or {}
+            out.append(f"### `{f['file']}:{f['line']}` — {f['title']}")
+            out.append(f"**Original severity:** {f['severity']}  |  **Repro:** not reproduced "
+                       f"({rec.get('reason','')})")
+            if f.get("explanation"):
+                out.append(f"**Claim:** {f['explanation']}")
+            out.append("")
+        out.append("---")
+        out.append("")
 
     for sev in SEVERITY_ORDER:
         out.append(f"## {sev.upper()}  ({counts[sev]})")
@@ -378,8 +473,8 @@ def main() -> int:
 
     cache_dir = Path(args.cache_dir).resolve()
     per_file, meta, manifest = load_findings(cache_dir)
-
-    report = render_report(per_file, meta, manifest)
+    verification = load_verification(cache_dir)
+    report = render_report(per_file, meta, manifest, verification=verification)
     out_path = cache_dir / "report.md"
     out_path.write_text(report)
     print(f"✓ wrote {out_path}")

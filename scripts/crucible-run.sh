@@ -12,16 +12,20 @@ META_FLAG=""
 PANEL_SIZE=2
 CACHE_DIR=""
 FILES=()
+VERIFY=0
+SYMPTOMS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
     --no-meta) META_FLAG="--no-meta"; shift ;;
+    --verify) VERIFY=1; shift ;;
+    --symptoms) SYMPTOMS="$2"; shift 2 ;;
     --panel-size) PANEL_SIZE="$2"; shift 2 ;;
     --cache-dir) CACHE_DIR="$2"; shift 2 ;;
     --help|-h)
       cat <<EOF
-Usage: $0 [--mode sequential|blind] [--no-meta] [--panel-size N] [--cache-dir <path>] <file1> <file2> ...
+Usage: $0 [--mode sequential|blind] [--no-meta] [--verify] [--symptoms "..."] [--panel-size N] [--cache-dir <path>] <file1> <file2> ...
 
 Runs the full Crucible workflow:
   1. Verify SOTA model panel is cached (run discover-premium.sh if not)
@@ -99,7 +103,18 @@ python3 "$SCRIPT_DIR/orchestrate.py" \
     --models $MODELS \
     --mode "$MODE" \
     --prompt-templates "$PROMPT_TEMPLATES" \
+    ${SYMPTOMS:+--symptoms "$SYMPTOMS"} \
     $META_FLAG
+
+# Step 5b — Dynamic verification (opt-in)
+if [[ "$VERIFY" -eq 1 ]]; then
+  echo "→ Dynamic verification (writing + running repro harnesses)..." >&2
+  python3 "$SCRIPT_DIR/verify_findings.py" \
+      --cache-dir "$CACHE_DIR" \
+      --models $MODELS \
+      --prompt-templates "$PROMPT_TEMPLATES" \
+      ${SYMPTOMS:+--symptoms "$SYMPTOMS"} || echo "⚠ verification stage failed (continuing to report)" >&2
+fi
 
 # Step 6 — Build report
 echo "→ Building report..." >&2
