@@ -122,12 +122,28 @@ def test_report_verified_tier():
     check("unconfirmed finding pulled out of HIGH", "ghost" not in high_block, "ghost still in HIGH block")
 
 
+def test_harness_import_guard():
+    from pathlib import Path
+    import verify_findings as vf
+    tp = Path("advisor.py")
+    check("guard: real import passes",
+          vf._harness_exercises_target("import advisor\nx=1", tp, "python") is True)
+    check("guard: from-import passes",
+          vf._harness_exercises_target("from advisor import Advisor", tp, "python") is True)
+    # the exact mock-reimplementation that fooled a real run: no import of the module
+    check("guard: reimplementation (no import) fails",
+          vf._harness_exercises_target("class MockAdvisor:\n  pass\nadvisor = MockAdvisor()", tp, "python") is False)
+    check("guard: bash not flagged",
+          vf._harness_exercises_target("python target.py", tp, "bash") is True)
+
+
 def main():
     test_prompt_templates_have_harness_keys()
     test_splice_symptoms()
     test_collect_runtime_findings()
     test_verify_one_finding_handles_nonstring_harness()
     test_report_verified_tier()
+    test_harness_import_guard()
     # later tasks append more test_* calls here
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
     return 1 if FAILED else 0

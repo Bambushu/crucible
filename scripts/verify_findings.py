@@ -351,6 +351,32 @@ def _resolve_target_path(cache_dir: Path, file_rel: str) -> Optional[Path]:
     return None
 
 
+def _harness_exercises_target(harness_src: str, target_path: Path, language: str) -> bool:
+    """True if the harness actually imports/loads the target module — i.e. it
+    exercises the REAL code, not a hand-written reimplementation. A harness that
+    redefines the buggy logic in a mock class proves nothing about the target, so
+    its verdict cannot be trusted. bash/other langs aren't guarded (return True)."""
+    module = re.escape(target_path.stem)
+    lang = (language or "").lower()
+    if lang in ("python", "py"):
+        pat = (rf"(?m)^\s*(?:import\s+{module}\b|from\s+{module}\s+import\b)"
+               rf"|import_module\(\s*['\"]{module}['\"]")
+        return re.search(pat, harness_src) is not None
+    if lang in ("javascript", "js", "node", "typescript", "ts"):
+        pat = rf"(?:require\(\s*['\"][^'\"]*{module}|from\s+['\"][^'\"]*{module})"
+        return re.search(pat, harness_src) is not None
+    return True  # bash/shell/other: can't reliably detect → don't flag
+
+
+_GUARD_NOTE = (
+    "\n--- CRUCIBLE GUARD ---\n"
+    "Your harness did NOT import the target module — it appears to REIMPLEMENT the unit "
+    "under test instead of exercising the real code. A reimplementation proves nothing about "
+    "the target. You MUST `import` the target module and drive the REAL object (monkeypatching "
+    "a method on the real instance is fine; replacing the whole class with your own is not). Regenerate."
+)
+
+
 def verify_one_finding(finding: dict, target_path: Path, models: list[str],
                        templates: dict, api_key: str, symptoms: str,
                        timeout: int, mem_mb: int, max_repair: int,
@@ -393,14 +419,22 @@ def verify_one_finding(finding: dict, target_path: Path, models: list[str],
         attempts += 1
         result = run_harness(harness_src, language, str(target_path),
                              timeout=timeout, mem_mb=mem_mb, keep=keep)
+        # Import-guard: a verdict from a harness that never imports the target
+        # is untrustworthy (it likely reimplements the unit). Force inconclusive
+        # so a real verdict can't slip through, and feed the failure back to repair.
+        exercises = _harness_exercises_target(harness_src, target_path, language)
+        if not exercises and result["verdict"] in ("reproduced", "not_reproduced"):
+            result = {**result, "verdict": "inconclusive",
+                      "reason": "harness did not import/exercise the target module (possible reimplementation)"}
         if result["verdict"] in ("reproduced", "not_reproduced", "skipped"):
             break
         if attempts > max_repair:
             break
+        guard_note = "" if exercises else _GUARD_NOTE
         repair_prompt = build_prompt(templates["harness_repair"], **{
             "finding-json": json.dumps(finding["raw"], indent=2),
             "previous-harness": harness_src,
-            "captured-output": (result["stdout"] + "\n--- STDERR ---\n" + result["stderr"])[:4000],
+            "captured-output": (result["stdout"] + "\n--- STDERR ---\n" + result["stderr"])[:4000] + guard_note,
         })
         content, _raw = call_openrouter(used_model, repair_prompt, api_key, costs_log=costs_log)
         obj = extract_json_object(content) if content else None

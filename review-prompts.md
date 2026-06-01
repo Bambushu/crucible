@@ -233,13 +233,13 @@ FILE: <target-file-path>
 <file-contents-with-line-numbers>
 
 HARD RULES — the harness runs in a locked sandbox:
-1. SELF-CONTAINED. One file. Import ONLY the unit under test from the target module (e.g. `from advisor import Advisor`). Do NOT import or invoke its main()/CLI entry point.
+1. SELF-CONTAINED. One file. Import ONLY the unit under test from the target module (e.g. `from advisor import Advisor`). Do NOT import or invoke its main()/CLI entry point. You MUST exercise the REAL imported code — NEVER reimplement the unit as your own mock/stub class and test that instead; a reimplementation proves nothing about the target and will be REJECTED. Monkeypatching a method on the real imported object is fine; replacing the whole class with your own is not.
 2. NO NETWORK. Every socket / HTTP / LLM / DB call WILL RAISE. If the unit under test makes such calls, MONKEYPATCH or stub them so the logic runs deterministically offline. CRITICAL: if a method only sets important state on its SUCCESS path (and skips it on a network-error path), letting the call fail will NOT reproduce the bug — you must simulate a SUCCESSFUL call by monkeypatching the method to set that state and return success.
-3. TIMING/ASYNC. If the bug involves threads/timers/scheduling, drive it deterministically and WAIT LONGER than the relevant delay before you assert (e.g. if a replay timer is 0.05s, sleep ~0.3s).
+3. TIMING/ASYNC. If the bug involves threads/timers/scheduling, drive it deterministically and WAIT LONGER than the relevant delay before you assert (e.g. if a replay timer is 0.05s, sleep ~0.3s). If the bug requires an event to occur DURING in-flight work (e.g. a new input arriving while a generation is running), make that event GENUINELY land while the in-flight flag is set — set the precondition state directly, or inject the event from inside the in-flight call. Do NOT rely on debounce/scheduler timing to create the overlap: a single-timer debounce may just cancel-and-reschedule so the overlap never happens and the bug's precondition is silently never met.
 4. VERDICT CONTRACT. Print the observed evidence (counts/values), then print EXACTLY ONE of:
        CRUCIBLE_VERDICT: REPRODUCED
        CRUCIBLE_VERDICT: NOT_REPRODUCED
-   then exit 0 in BOTH cases. REPRODUCED means the finding's bug was observed; NOT_REPRODUCED means you drove it and the bug did not occur.
+   then exit 0 in BOTH cases. REPRODUCED means the finding's MECHANISM actually occurred — not merely that a count equalled some number for an unrelated reason. Before printing REPRODUCED, confirm the buggy path truly executed: the precondition was met AND the faulty behaviour fired (e.g. a replay WAS scheduled and was THEN rejected — NOT that no replay was ever attempted). If you cannot confirm the mechanism ran, print NOT_REPRODUCED. Add a line stating which mechanism step you confirmed.
 5. NO destructive operations (no file deletion, no os.system to mutate state, no writes outside the working dir).
 
 OUTPUT: return ONLY a single JSON object, no prose, no markdown fences:
