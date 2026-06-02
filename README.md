@@ -23,6 +23,7 @@ A Claude Code skill that walks your code piece-by-piece and puts every file unde
 /crucible --all                        # review the whole repo
 /crucible --paths "src/api/**/*.ts"    # review a glob
 /crucible --diff main...HEAD           # review a specific range
+/crucible --verify                     # also EXECUTE a repro for runtime-flagged findings
 ```
 
 Behind the scenes, Claude:
@@ -31,8 +32,9 @@ Behind the scenes, Claude:
 2. Loads a panel of four current SOTA paid models from OpenRouter, each from a different vendor family (e.g. DeepSeek, Google, Moonshot, MiniMax).
 3. Reviews every in-scope file through the panel: pass 1 finds, pass 2 validates, pass 3 consolidates with severity ranks.
 4. Runs one cross-file architectural meta-pass to catch repeated anti-patterns, missing layers, and coupling smells.
-5. **Verifies the report.** Claude reads every CRITICAL and HIGH finding back against the actual source code, marks them confirmed, refined, disputed, or "needs human judgment", and adds up to three findings the panel missed.
-6. Drops a single `report.md` in `.crucible-cache/<run-id>/`.
+5. **(opt-in `--verify`) Executes a repro for the runtime bugs.** Some bugs only exist when the code runs — a retry the surrounding rate-limit always rejects, a `2>/dev/null` that hides a device error. For each finding the panel tags *runtime-checkable*, a model writes a minimal repro harness, Crucible runs it in a **locked sandbox**, and findings that actually reproduce are promoted to a **VERIFIED (executed repro)** tier with the harness and its output attached. Repros that fail are demoted to *unconfirmed*.
+6. **Verifies the report.** Claude reads every CRITICAL and HIGH finding back against the actual source code, marks them confirmed, refined, disputed, or "needs human judgment", and adds up to three findings the panel missed.
+7. Drops a single `report.md` in `.crucible-cache/<run-id>/`.
 
 Findings are persisted as they land, so a network blip or rate-limit hiccup mid-run is just a `--resume <run-id>` away.
 
@@ -42,16 +44,18 @@ Findings are persisted as they land, so a network blip or rate-limit hiccup mid-
 
 Single-model review has correlated blind spots. If GPT misses a vulnerability, the runner-up GPT-class model usually misses it too. A panel of models drawn from genuinely different training runs (DeepSeek vs. Gemini vs. Kimi vs. MiniMax) does not.
 
-But three OS models converging on the same hallucination is still a hallucination. So Crucible adds a final step: Claude reads the report against the actual code and tells you which findings are real, which are misreads, and what the panel missed. That verification phase is what makes the deliverable trustworthy enough to act on without re-reading every file yourself.
+But three OS models converging on the same hallucination is still a hallucination. So Crucible adds a verification step: Claude reads the report against the actual code and tells you which findings are real, which are misreads, and what the panel missed. That phase is what makes the deliverable trustworthy enough to act on without re-reading every file yourself.
+
+And there's a blind spot more models can't fix: **bugs that only exist when the code runs.** A method that schedules a retry the surrounding rate-limit always rejects; a swallowed error behind `2>/dev/null`; an off-by-one that only bites on the third pass. Each method reads correct in isolation — the bug lives in their composition over time, and no amount of *reading* finds it. With `--verify`, a model writes a minimal repro harness for each runtime-flagged finding and Crucible **actually runs it** in a sandbox. "Looks suspicious" becomes "here's the run that proves it" — or the finding is demoted to unconfirmed.
 
 Compared to alternatives:
 
-| | Scope | Models | Verification |
-|---|---|---|---|
-| `/rival` (single-file) | One file or short diff | 1 OpenRouter model | None |
-| GitHub Copilot review | Whole PR | One model family | None |
-| Internal personas (e.g. RaadSmid) | Diff or repo | Same Claude, multiple personas | Self-check |
-| **Crucible** | **Diff, glob, or whole repo** | **4 SOTA models, 4 different families** | **Claude reads findings back against source** |
+| | Scope | Models | Verification | Runtime proof |
+|---|---|---|---|---|
+| `/rival` (single-file) | One file or short diff | 1 OpenRouter model | None | None |
+| GitHub Copilot review | Whole PR | One model family | None | None |
+| Internal personas (e.g. RaadSmid) | Diff or repo | Same Claude, multiple personas | Self-check | None |
+| **Crucible** | **Diff, glob, or whole repo** | **4 SOTA models, 4 different families** | **Claude reads findings back against source** | **Executes a repro harness (`--verify`)** |
 
 If you only need a quick second opinion on one file, use `/rival`. Crucible is for when the work matters enough to justify a $0.10–$0.75 audit run.
 
@@ -118,6 +122,8 @@ Pre-flight always shows the estimate before kicking off, and pauses for confirma
 
 You can swap to free-tier models (`/rival`'s panel) by deleting `~/.crucible/models.json`. Crucible will fall back to the free roster and warn you it's running in degraded mode.
 
+`--verify` costs extra only when you pass it: ~1–3 additional model calls per runtime-flagged finding (writing and, if needed, repairing the harness) — typically a few cents for a handful of findings. Default runs never invoke it, and `--verify-limit N` (default 10) caps how many findings get a repro.
+
 ---
 
 ## Modes
@@ -135,6 +141,8 @@ You can swap to free-tier models (`/rival`'s panel) by deleting `~/.crucible/mod
 /crucible --include-tests              # don't skip *.test.* / *.spec.*
 /crucible --resume <run-id>            # resume an interrupted run
 /crucible --deployment-context "..."   # free-text scoping (see below)
+/crucible --symptoms "..."             # observed failures, fed to the panel (see below)
+/crucible --verify                     # write + RUN a repro for runtime-flagged findings (see below)
 ```
 
 Combine freely: `/crucible --all --deep --blind` runs the full repo with three models per file independently, then does consensus dedup.
@@ -149,6 +157,27 @@ This is the highest-leverage flag. Frontier models default to "this code could r
 
 In real runs this is the single biggest false-positive reduction.
 
+### `--verify` — execute the repro
+
+Static review, no matter how many models, can't see a bug that only exists at runtime. `--verify` closes that gap. After the panel runs, every finding it tagged *runtime-checkable* (timing, ordering, shared mutable state, resource leaks, off-by-one, silent failures) gets handed to a model that writes a **minimal, self-contained repro harness**. Crucible runs each harness in a locked sandbox and records whether the bug actually reproduced.
+
+```bash
+/crucible --verify --symptoms "the retry never fires a second time"
+```
+
+The sandbox is the non-negotiable part — it runs **model-written code against your code**, so each harness runs:
+
+- in a **temp-dir copy** of the target file (never your working tree),
+- with **no network** (sockets are blocked; LLM/HTTP calls in the unit under test must be stubbed),
+- under a hard **wall-clock timeout** and CPU / file-size / memory limits,
+- in a **scrubbed environment** (no inherited secrets or proxies).
+
+A harness must print `CRUCIBLE_VERDICT: REPRODUCED` / `NOT_REPRODUCED`. Confirmed findings move to a **VERIFIED (executed repro)** tier with the harness and its output inlined; failed repros drop to **Unconfirmed Hypotheses**. Two guards keep a verdict honest: an **import-guard** rejects any harness that reimplements the unit instead of importing the real target (its verdict can't be trusted), and Claude's verification pass reads each harness to confirm it drives the cited bug. It's opt-in because it costs a little more — default runs never touch it.
+
+### `--symptoms`
+
+Free text describing what actually went wrong in the field. It's spliced into every per-file prompt so the panel can match code against observed behaviour — `"audio silently not captured"` next to a `subprocess(..., stderr=DEVNULL)` is an instant hit. Pairs naturally with `--verify`: the symptom steers both the finding and the repro.
+
 ---
 
 ## Sample report
@@ -162,6 +191,28 @@ Models:   deepseek/deepseek-v4-pro, google/gemini-3.1-pro-preview, moonshotai/ki
 Mode:     sequential
 Duration: 8m 14s
 Total findings: 17 (2 critical, 5 high, 7 medium, 3 low)
+
+---
+
+## VERIFIED (executed repro)  (1)        ← only with --verify
+
+### `src/queue/worker.ts:88` — Retry scheduled inside the lock the retry itself needs
+Verdict:  reproduced via executed harness (deepseek-v4-pro, 2 attempts)
+Original severity: high
+Why it matters: enqueueRetry() runs while the worker still holds this.lock; the retry
+                path re-acquires the same lock and is dropped every time. Reads fine
+                per-method — only the runtime interleaving shows it.
+Repro harness (ran in sandbox: temp-dir copy, no network, 15s timeout):
+    from worker import Worker            # imports the REAL unit, not a reimplementation
+    w = Worker(); runs = [0]
+    w._do_work = lambda *_: runs.__setitem__(0, runs[0] + 1)   # stub work, no network
+    w.on_job({"id": 1}); w.on_job({"id": 2})  # 2nd job lands mid-process -> schedules retry
+    time.sleep(0.3)                       # wait past the 50ms retry timer
+    print(f"_do_work ran {runs[0]}x; expected 2")
+    print("CRUCIBLE_VERDICT: REPRODUCED" if runs[0] == 1 else "CRUCIBLE_VERDICT: NOT_REPRODUCED")
+Harness output:
+    _do_work ran 1x; expected 2
+    CRUCIBLE_VERDICT: REPRODUCED
 
 ---
 
@@ -211,10 +262,11 @@ Additional findings caught by Claude verifier (2)
 ```
 crucible/
 ├── skill.md              # the full Claude Code skill spec (the brain)
-├── review-prompts.md     # the four prompt templates (pass 1/2/3 + meta)
+├── review-prompts.md     # prompt templates (pass 1/2/3 + meta + harness writer/repair)
 ├── scripts/
 │   ├── crucible-run.sh   # one-shot end-to-end wrapper
 │   ├── orchestrate.py    # per-file dispatch engine, OpenRouter calls
+│   ├── verify_findings.py # --verify: writes + sandbox-runs repro harnesses
 │   ├── build_report.py   # aggregates per-file findings into report.md
 │   ├── compare-reports.py # diff two runs side-by-side
 │   ├── chunk-file.py     # language-aware splitter for files > 1500 lines
@@ -248,11 +300,14 @@ Because the verification phase needs Claude. The whole point is that the OS pane
 **Why OpenRouter instead of calling each model's native API?**
 One key, one billing, one rate-limit story, and it's the cleanest place to compare frontier models from different vendors as they ship. If your favorite model isn't on OpenRouter you can edit `scripts/orchestrate.py` to add a custom backend, but the default works for ~95% of users.
 
+**`--verify` runs model-written code — isn't that dangerous?**
+It runs in a locked sandbox, never against your working tree: each harness executes in a throwaway temp-dir copy of the single target file, with the network blocked, a hard wall-clock timeout, and CPU/file-size/memory limits, in a scrubbed environment. The threat model is buggy-not-malicious repro harnesses, so it's a soft sandbox (in-process network block, no kernel jail) — don't point `--verify` at a target whose mere import wipes a disk. Two guards keep verdicts honest: an import-guard forces "inconclusive" if a harness reimplements the unit instead of importing the real one, and Claude reads every reproduced harness to confirm it drives the cited bug. It's off by default.
+
 **How is this different from `/raadsmid`?**
 RaadSmid spins up four Claude personas with different lenses (security, performance, architecture, user-experience). It's fast and free but every persona is the same model. Crucible spins up four genuinely different models from four different vendor families, then has Claude verify. RaadSmid is a quick second-opinion. Crucible is a deep audit.
 
 **Can I run it in CI?**
-Yes. `scripts/crucible-run.sh` is a single-command end-to-end wrapper that runs without the LLM-driven orchestration. Pipe its `report.md` into a PR comment, or fail the build on critical findings. The verification phase is skipped in this mode (it requires Claude); you get the panel's raw output.
+Yes. `scripts/crucible-run.sh` is a single-command end-to-end wrapper that runs without the LLM-driven orchestration — pass `--verify` and `--symptoms` through it too. Pipe its `report.md` into a PR comment, or fail the build on critical findings. `--verify` works headless (the harness-writing is OpenRouter and the sandbox is local), so you still get the **VERIFIED (executed repro)** tier; only Claude's final read-back of the report is skipped in this mode.
 
 **What does it cost to run on this repo?**
 $0.18, roughly. Try it.
